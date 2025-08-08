@@ -1,10 +1,13 @@
-name: news-backfill
+name: fetch-news-15m
 
 on:
-  workflow_dispatch: {}   # manual run from Actions tab
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/15 13-19 * * 1-5"  # 9:00–3:59 PM ET (UTC)
+    - cron: "30 20 * * 1-5"       # 4:30 PM ET final sweep
 
 jobs:
-  backfill:
+  fetch-news:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -12,10 +15,11 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Run Alpaca news backfill (2 years)
+      - name: Fetch latest news window and upsert
         env:
           DB_URL: ${{ secrets.DB_URL }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
-          SYMBOLS: ${{ secrets.SYMBOLS }}   # e.g. AAPL,MSFT,AMD,NVDA,QQQ,SPY
-        run: python news_backfill.py
+          SYMBOLS: ${{ secrets.SYMBOLS }}
+          NEWS_WINDOW_HOURS: "48"     # adjust if you want
+        run: python news_update.py
