@@ -1,0 +1,26 @@
+name: fetch-ohlcv-15m
+
+on:
+  schedule:
+    # Every 15 minutes between 14:30 and 21:00 UTC (9:30–16:00 Eastern)
+    - cron: "*/15 14-20 * * 1-5"
+    - cron: "30 21 * * 1-5"   # final run at 4:30 PM Eastern to catch last bar
+  workflow_dispatch: {}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Fetch latest 30m window (15m bars)
+        env:
+          DB_URL: ${{ secrets.DB_URL }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          ALPACA_DATA_FEED: ${{ secrets.ALPACA_DATA_FEED }}
+          SYMBOLS: ${{ secrets.SYMBOLS }}
+        run: python update.py
