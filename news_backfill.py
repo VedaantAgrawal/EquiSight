@@ -6,18 +6,17 @@ from datetime import datetime, timedelta, timezone
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.requests import NewsRequest
 
-# --- DB URL normalize (accepts postgresql+psycopg:// or postgresql://) ---
-raw_url = os.environ["DB_URL"].strip()
+# -------------------- ENV + DB URL normalize --------------------
+raw_url = os.environ["DB_URL"].strip()  # may be postgresql+psycopg://... or postgresql://...
 DB_URL = raw_url.replace("postgresql+psycopg://", "postgresql://")
 if "sslmode=" not in DB_URL:
     DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
 
-# --- Alpaca + symbols ---
 ALPACA_API_KEY = os.environ["ALPACA_API_KEY"]
 ALPACA_API_SECRET = os.environ["ALPACA_API_SECRET"]
 SYMBOLS = [s.strip().upper() for s in os.environ["SYMBOLS"].split(",") if s.strip()]
 
-# --- Ensure table (with composite PK) + migrate if needed ---
+# -------------------- Ensure table + migrate PK ------------------
 DDL_CREATE = """
 CREATE TABLE IF NOT EXISTS news (
     id TEXT NOT NULL,
@@ -27,43 +26,33 @@ CREATE TABLE IF NOT EXISTS news (
     author TEXT,
     source TEXT,
     url TEXT,
-    published_at TIMESTAMPTZ,
-    PRIMARY KEY (id, symbol)
+    published_at TIMESTAMPTZ
 );
 """
 
-# Migrate old schema where PRIMARY KEY was just (id)
 DDL_MIGRATE = """
--- drop old single-column PK if present, then ensure composite PK
+BEGIN;
+
+-- Drop old single-column PK if it exists (usually news_pkey)
+ALTER TABLE news DROP CONSTRAINT IF EXISTS news_pkey;
+
+-- If no PK exists, add composite (id, symbol)
 DO $$
 BEGIN
-  -- If there is any primary key on news, drop it (covers old id-only PK)
-  IF EXISTS (
-    SELECT 1 FROM pg_constraint c
-    JOIN pg_class t ON t.oid = c.conrelid
-    WHERE t.relname = 'news' AND c.contype = 'p'
-  ) THEN
-    ALTER TABLE news DROP CONSTRAINT IF EXISTS news_pkey;
-  END IF;
-
-  -- Add composite PK if it's not already there
   IF NOT EXISTS (
     SELECT 1
     FROM pg_constraint c
     JOIN pg_class t ON t.oid = c.conrelid
-    JOIN pg_attribute a1 ON a1.attrelid = t.oid AND a1.attnum = ANY (c.conkey)
-    WHERE t.relname = 'news'
-      AND c.contype = 'p'
-      AND ARRAY(SELECT attname FROM pg_attribute
-                WHERE attrelid = t.oid AND attnum = ANY (c.conkey)
-                ORDER BY attnum)
-          = ARRAY['id','symbol']
+    WHERE t.relname = 'news' AND c.contype = 'p'
   ) THEN
     ALTER TABLE news ADD PRIMARY KEY (id, symbol);
   END IF;
 END$$;
 
+-- Helpful index for queries
 CREATE INDEX IF NOT EXISTS news_symbol_time_idx ON news (symbol, published_at DESC);
+
+COMMIT;
 """
 
 with psycopg.connect(DB_URL) as conn:
@@ -72,20 +61,21 @@ with psycopg.connect(DB_URL) as conn:
         cur.execute(DDL_MIGRATE)
     conn.commit()
 
-# --- Alpaca client ---
+# -------------------- Alpaca client ------------------------------
 news_client = NewsClient(api_key=ALPACA_API_KEY, secret_key=ALPACA_API_SECRET)
 
-# --- 2-year backfill window ---
+# 2-year backfill window
 start_date = (datetime.now(timezone.utc) - timedelta(days=730)).date()
 end_date = datetime.now(timezone.utc).date()
 
+# -------------------- Backfill loop ------------------------------
 for symbol in SYMBOLS:
     print(f"[news_backfill] {symbol}: {start_date} → {end_date}")
     page_token = None
 
     while True:
         req = NewsRequest(
-            symbols=symbol,     # string, not list
+            symbols=symbol,  # string (comma-separated supported too)
             start=start_date,
             end=end_date,
             limit=50,
@@ -97,14 +87,14 @@ for symbol in SYMBOLS:
         if df is None or df.empty:
             break
 
+        # Prepare rows for bulk insert
         rows = []
         for _, r in df.iterrows():
-            # authors may come as list or string depending on SDK version
             authors = r.get("authors")
             if isinstance(authors, (list, tuple)):
                 authors = ", ".join(authors)
             if not authors:
-                authors = r.get("author")  # fallback
+                authors = r.get("author")  # fallback if SDK shape varies
 
             rows.append((
                 str(r.get("id")),
