@@ -1,0 +1,5 @@
+alpaca-py>=0.21
+sqlalchemy>=2.0
+psycopg[binary]>=3.2
+python-dotenv>=1.0
+tenacity>=8.2
