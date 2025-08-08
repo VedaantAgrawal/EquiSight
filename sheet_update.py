@@ -1,53 +1,61 @@
 import os
 import json
 import datetime as dt
+
 import psycopg
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# === Load Service Account credentials from GitHub secret ===
+
+# -------- Google auth (service account JSON comes from GitHub secret) --------
 service_account_info = json.loads(os.environ["GCP_SERVICE_ACCOUNT"])
-
-# === Google Sheets setup ===
-SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 creds = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, SCOPES)
-client = gspread.authorize(creds)
+gc = gspread.authorize(creds)
 
-# === Env vars for DB ===
-DB_URL = os.environ["DB_URL"]  # postgresql+psycopg://... from Neon
-SHEET_ID = os.environ["SHEET_ID"]  # we'll store your sheet ID in GitHub Secrets
+SHEET_ID = os.environ["SHEET_ID"]
+ws = gc.open_by_key(SHEET_ID).sheet1  # use the first worksheet
 
-# === Connect to Google Sheet ===
-sheet = client.open_by_key(SHEET_ID).sheet1  # first worksheet
 
-# === Connect to Neon ===
-with psycopg.connect(DB_URL) as conn:
-    cur = conn.cursor()
+# ----------------------- Build a psycopg-friendly DSN ------------------------
+raw_db_url = os.environ["DB_URL"].strip()  # e.g. postgresql+psycopg://... or postgresql://...
+dsn = raw_db_url.replace("postgresql+psycopg://", "postgresql://")
 
-    # Get today's date in UTC (adjust if you want US/Eastern)
-    today = dt.datetime.now(dt.timezone.utc).date()
+# Ensure Neon-required SSL flag is present
+if "sslmode=" not in dsn:
+    dsn = dsn + ("&" if "?" in dsn else "?") + "sslmode=require"
 
-    cur.execute("""
-        SELECT symbol, t, open, high, low, close, volume
-        FROM ohlcv_bars
-        WHERE t::date = %s
-        ORDER BY symbol, t;
-    """, (today,))
 
-    rows = cur.fetchall()
+# ------------------------- Query today's OHLCV rows --------------------------
+# Uses UTC date. If you prefer US/Eastern “trading day”, we can shift the timezone.
+today_utc = dt.datetime.now(dt.timezone.utc).date()
 
-# === Clear sheet ===
-sheet.clear()
+query = """
+    SELECT symbol, t, open, high, low, close, volume
+    FROM ohlcv_bars
+    WHERE t::date = %s
+    ORDER BY symbol, t;
+"""
 
-# === Write header ===
+with psycopg.connect(dsn) as conn:
+    with conn.cursor() as cur:
+        cur.execute(query, (today_utc,))
+        rows = cur.fetchall()
+
+
+# --------------------------- Write to Google Sheet ---------------------------
+# Build data array (header + all rows) and push in ONE update for speed.
 header = ["symbol", "timestamp_utc", "open", "high", "low", "close", "volume"]
-sheet.append_row(header)
+data = [header]
+for symbol, ts, o, h, l, c, v in rows:
+    # standardize timestamp for Sheets
+    data.append([symbol, ts.isoformat(), o, h, l, c, v])
 
-# === Write data ===
-for row in rows:
-    # Convert timestamp to ISO string for Sheets
-    row = list(row)
-    row[1] = row[1].isoformat()
-    sheet.append_row(row)
+# Clear entire sheet, then write starting at A1
+ws.clear()
+ws.update("A1", data, value_input_option="RAW")
 
-print(f"[sheet_update] Wrote {len(rows)} rows to Google Sheet for {today}")
+print(f"[sheet_update] Wrote {len(rows)} rows to Google Sheet for {today_utc}")
