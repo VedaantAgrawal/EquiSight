@@ -1,6 +1,7 @@
 name: update-db-and-sheet-15m
 
 on:
+  workflow_dispatch:   # allows manual runs
   schedule:
     - cron: "*/15 13-19 * * 1-5"  # every 15 min, 13:00–19:59 UTC, Mon–Fri
     - cron: "30 20 * * 1-5"       # one extra run at 20:30 UTC for the 4:30pm bar
