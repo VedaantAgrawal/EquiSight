@@ -1,10 +1,6 @@
 name: fetch-ohlcv-15m
 
 on:
-  schedule:
-    # Every 15 minutes between 14:30 and 21:00 UTC (9:30–16:00 Eastern)
-    - cron: "*/15 14-20 * * 1-5"
-    - cron: "30 21 * * 1-5"   # final run at 4:30 PM Eastern to catch last bar
   workflow_dispatch: {}
 
 jobs:
