@@ -46,7 +46,7 @@ for symbol in SYMBOLS:
     page_token = None
     while True:
         req = NewsRequest(
-            symbols=[symbol],
+            symbols=symbol,
             start=start_date,
             end=end_date,
             limit=50,
@@ -69,17 +69,17 @@ for symbol in SYMBOLS:
                         (
                             item.id,
                             symbol,
-                            item.headline,
-                            item.summary,
-                            ", ".join(item.authors) if getattr(item, "authors", None) else None,
-                            item.source,
-                            item.url,
-                            item.created_at,  # TIMESTAMPTZ
+                            getattr(item, "headline", None),
+                            getattr(item, "summary", None),
+                            ", ".join(getattr(item, "authors", []) or []) or getattr(item, "author", None),
+                            getattr(item, "source", None),
+                            getattr(item, "url", None),
+                            getattr(item, "created_at", None),
                         ),
                     )
             conn.commit()
 
-        page_token = resp.next_page_token
+        page_token = getattr(resp, "next_page_token", None)
         if not page_token:
             break
 
