@@ -2,40 +2,80 @@ import os
 import psycopg
 from datetime import datetime, timedelta, timezone
 
-# per SDK README, import path is this:
+# Alpaca SDK (news)
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.requests import NewsRequest
 
-# --- ENV / DB URL normalize ---
+# --- DB URL normalize (accepts postgresql+psycopg:// or postgresql://) ---
 raw_url = os.environ["DB_URL"].strip()
 DB_URL = raw_url.replace("postgresql+psycopg://", "postgresql://")
 if "sslmode=" not in DB_URL:
     DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
 
+# --- Alpaca + symbols ---
 ALPACA_API_KEY = os.environ["ALPACA_API_KEY"]
 ALPACA_API_SECRET = os.environ["ALPACA_API_SECRET"]
 SYMBOLS = [s.strip().upper() for s in os.environ["SYMBOLS"].split(",") if s.strip()]
 
-# --- ensure table exists ---
-CREATE_TABLE_SQL = """
+# --- Ensure table (with composite PK) + migrate if needed ---
+DDL_CREATE = """
 CREATE TABLE IF NOT EXISTS news (
-    id TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
     symbol TEXT NOT NULL,
     headline TEXT,
     summary TEXT,
     author TEXT,
     source TEXT,
     url TEXT,
-    published_at TIMESTAMPTZ
+    published_at TIMESTAMPTZ,
+    PRIMARY KEY (id, symbol)
 );
 """
+
+# Migrate old schema where PRIMARY KEY was just (id)
+DDL_MIGRATE = """
+-- drop old single-column PK if present, then ensure composite PK
+DO $$
+BEGIN
+  -- If there is any primary key on news, drop it (covers old id-only PK)
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid
+    WHERE t.relname = 'news' AND c.contype = 'p'
+  ) THEN
+    ALTER TABLE news DROP CONSTRAINT IF EXISTS news_pkey;
+  END IF;
+
+  -- Add composite PK if it's not already there
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_attribute a1 ON a1.attrelid = t.oid AND a1.attnum = ANY (c.conkey)
+    WHERE t.relname = 'news'
+      AND c.contype = 'p'
+      AND ARRAY(SELECT attname FROM pg_attribute
+                WHERE attrelid = t.oid AND attnum = ANY (c.conkey)
+                ORDER BY attnum)
+          = ARRAY['id','symbol']
+  ) THEN
+    ALTER TABLE news ADD PRIMARY KEY (id, symbol);
+  END IF;
+END$$;
+
+CREATE INDEX IF NOT EXISTS news_symbol_time_idx ON news (symbol, published_at DESC);
+"""
+
 with psycopg.connect(DB_URL) as conn:
     with conn.cursor() as cur:
-        cur.execute(CREATE_TABLE_SQL)
+        cur.execute(DDL_CREATE)
+        cur.execute(DDL_MIGRATE)
     conn.commit()
 
+# --- Alpaca client ---
 news_client = NewsClient(api_key=ALPACA_API_KEY, secret_key=ALPACA_API_SECRET)
 
+# --- 2-year backfill window ---
 start_date = (datetime.now(timezone.utc) - timedelta(days=730)).date()
 end_date = datetime.now(timezone.utc).date()
 
@@ -45,7 +85,7 @@ for symbol in SYMBOLS:
 
     while True:
         req = NewsRequest(
-            symbols=symbol,           # <- string, not list
+            symbols=symbol,     # string, not list
             start=start_date,
             end=end_date,
             limit=50,
@@ -53,22 +93,25 @@ for symbol in SYMBOLS:
         )
         page = news_client.get_news(req)
 
-        # Use the DataFrame the SDK provides
         df = getattr(page, "df", None)
         if df is None or df.empty:
             break
 
-        # Normalize expected columns
-        # DF columns typically include: id, headline, summary, author(s), source, url, created_at, symbols, etc.
         rows = []
         for _, r in df.iterrows():
+            # authors may come as list or string depending on SDK version
+            authors = r.get("authors")
+            if isinstance(authors, (list, tuple)):
+                authors = ", ".join(authors)
+            if not authors:
+                authors = r.get("author")  # fallback
+
             rows.append((
                 str(r.get("id")),
                 symbol,
                 r.get("headline"),
                 r.get("summary"),
-                # authors may be a list or string depending on version
-                ", ".join(r["authors"]) if isinstance(r.get("authors"), (list, tuple)) else r.get("author") or r.get("authors"),
+                authors,
                 r.get("source"),
                 r.get("url"),
                 r.get("created_at")
@@ -80,13 +123,12 @@ for symbol in SYMBOLS:
                     """
                     INSERT INTO news (id, symbol, headline, summary, author, source, url, published_at)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (id) DO NOTHING;
+                    ON CONFLICT (id, symbol) DO NOTHING;
                     """,
                     rows
                 )
             conn.commit()
 
-        # paginate if available
         page_token = getattr(page, "next_page_token", None)
         if not page_token:
             break
