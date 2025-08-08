@@ -1,10 +1,6 @@
 name: update-google-sheet-15m
 
 on:
-  schedule:
-    # Every 15 min between 14:30 and 21:00 UTC (9:30 AM – 4:00 PM ET) Mon–Fri
-    - cron: "*/15 14-20 * * 1-5"
-    - cron: "30 21 * * 1-5" # Final run after close to catch last bar
   workflow_dispatch: {}     # Allow manual run
 
 jobs:
