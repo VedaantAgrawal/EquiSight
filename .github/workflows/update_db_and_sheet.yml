@@ -2,10 +2,8 @@ name: update-db-and-sheet-15m
 
 on:
   schedule:
-    # Every 15 min between 14:30–21:00 UTC (9:30 AM–4:00 PM ET), Mon–Fri
-    - cron: "*/15 14-20 * * 1-5"
-    - cron: "30 21 * * 1-5"   # final run after close
-  workflow_dispatch: {}
+    - cron: "*/15 13-19 * * 1-5"  # every 15 min, 13:00–19:59 UTC, Mon–Fri
+    - cron: "30 20 * * 1-5"       # one extra run at 20:30 UTC for the 4:30pm bar
 
 concurrency:
   group: db-and-sheet
