@@ -1,0 +1,21 @@
+name: news-backfill
+
+on:
+  workflow_dispatch: {}   # manual run from Actions tab
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run Alpaca news backfill (2 years)
+        env:
+          DB_URL: ${{ secrets.DB_URL }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          SYMBOLS: ${{ secrets.SYMBOLS }}   # e.g. AAPL,MSFT,AMD,NVDA,QQQ,SPY
+        run: python news_backfill.py
