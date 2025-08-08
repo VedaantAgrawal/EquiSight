@@ -6,3 +6,7 @@ tenacity>=8.2
 gspread>=5.7
 oauth2client>=4.1
 psycopg[binary]>=3.2
+gunicorn
+dash
+plotly
+pandas
