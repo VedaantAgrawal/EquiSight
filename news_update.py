@@ -19,9 +19,9 @@ PAUSE_SEC    = float(os.getenv("NEWS_PAUSE_SEC", "0.2"))
 BASE_URL = "https://data.alpaca.markets/v1beta1/news"
 HEADERS  = {"Apca-Api-Key-Id": ALPACA_API_KEY, "Apca-Api-Secret-Key": ALPACA_API_SECRET}
 
-# ---------- SCHEMA (day-only table) ----------
-DDL_TODAY = """
-CREATE TABLE IF NOT EXISTS today_news (
+# ---------- SCHEMA ----------
+DDL_NEWS = """
+CREATE TABLE IF NOT EXISTS news (
     id TEXT NOT NULL,
     symbol TEXT NOT NULL,
     headline TEXT,
@@ -29,34 +29,28 @@ CREATE TABLE IF NOT EXISTS today_news (
     author TEXT,
     source TEXT,
     url TEXT,
-    published_at TIMESTAMPTZ NOT NULL,
+    published_at TIMESTAMPTZ,
     PRIMARY KEY (id, symbol)
 );
 """
-DDL_IDX = "CREATE INDEX IF NOT EXISTS today_news_symbol_time_idx ON today_news (symbol, published_at DESC);"
+DDL_NEWS_IDX = "CREATE INDEX IF NOT EXISTS news_symbol_time_idx ON news (symbol, published_at DESC);"
 
-def ensure_today_table():
+def ensure_schema():
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cur:
-            cur.execute(DDL_TODAY)
-            cur.execute(DDL_IDX)
+            cur.execute(DDL_NEWS)
+            cur.execute(DDL_NEWS_IDX)
         conn.commit()
 
-def wipe_if_old_day():
-    """Keep only CURRENT_DATE rows so table is 'today only'."""
-    with psycopg.connect(DB_URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM today_news WHERE published_at::date < CURRENT_DATE;")
-        conn.commit()
-
-def upsert_today(rows):
+def upsert_news(rows):
+    """Insert batch into news table, skip duplicates."""
     if not rows:
         return 0
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cur:
             cur.executemany(
                 """
-                INSERT INTO today_news (id, symbol, headline, summary, author, source, url, published_at)
+                INSERT INTO news (id, symbol, headline, summary, author, source, url, published_at)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (id, symbol) DO NOTHING;
                 """,
@@ -66,14 +60,14 @@ def upsert_today(rows):
     return len(rows)
 
 def fetch_symbol(symbol: str, start_date, end_date) -> int:
-    """Fetch news for one symbol between inclusive dates, paging via page_token."""
+    """Fetch news for one symbol between inclusive DATES (YYYY-MM-DD), paging via page_token."""
     total = 0
     page_token = None
     while True:
         params = {
             "symbols": symbol,
-            "start": start_date.isoformat(),  # YYYY-MM-DD
-            "end":   end_date.isoformat(),    # YYYY-MM-DD
+            "start": start_date.isoformat(),
+            "end":   end_date.isoformat(),
             "limit": PAGE_LIMIT,
             "sort":  "asc",
         }
@@ -92,7 +86,7 @@ def fetch_symbol(symbol: str, start_date, end_date) -> int:
         for a in articles:
             aid = str(a.get("id") or a.get("_id") or a.get("guid") or "")
             if not aid:
-                continue  # skip if no stable id
+                continue
             authors = a.get("authors")
             if isinstance(authors, list):
                 authors = ", ".join(authors)
@@ -107,7 +101,7 @@ def fetch_symbol(symbol: str, start_date, end_date) -> int:
                 a.get("created_at") or a.get("published_at"),
             ))
 
-        total += upsert_today(rows)
+        total += upsert_news(rows)
         page_token = data.get("next_page_token")
         if not page_token:
             break
@@ -115,22 +109,20 @@ def fetch_symbol(symbol: str, start_date, end_date) -> int:
     return total
 
 def run():
-    ensure_today_table()
-    wipe_if_old_day()  # ensure table is "today only" before inserting
+    ensure_schema()
 
     now = datetime.now(timezone.utc)
     start_dt = now - timedelta(hours=WINDOW_HOURS)
-    # We pass dates to the API; table will keep only CURRENT_DATE rows after wipe.
     start_date = start_dt.date()
     end_date   = now.date()
 
     grand = 0
     for sym in SYMBOLS:
         n = fetch_symbol(sym, start_date, end_date)
-        print(f"[today_news] {sym}: +{n} rows ({start_date} → {end_date})")
+        print(f"[news_update] {sym}: +{n} rows ({start_date} → {end_date})")
         grand += n
         time.sleep(PAUSE_SEC)
-    print(f"[today_news] Done. Inserted ~{grand} rows this run.")
+    print(f"[news_update] Done. Inserted ~{grand} rows into news.")
 
 if __name__ == "__main__":
     run()
