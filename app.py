@@ -64,7 +64,6 @@ def load_today_sheet_df():
     return df.reset_index(drop=True)
 
 def make_candle(fig_df: pd.DataFrame, symbol: str) -> go.Figure:
-    # Fixed UTC RTH window 13:30 → 19:45
     today = pd.Timestamp.now(tz="UTC").date()
     start = pd.Timestamp.combine(today, dt.time(13, 30, tzinfo=dt.timezone.utc))
     end   = pd.Timestamp.combine(today, dt.time(19, 45, tzinfo=dt.timezone.utc))
