@@ -1,0 +1,25 @@
+name: news-backfill-rolling
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  backfill-news:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Backfill Alpaca news in rolling windows
+        env:
+          DB_URL: ${{ secrets.DB_URL }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          SYMBOLS: ${{ secrets.SYMBOLS }}
+          NEWS_TOTAL_DAYS: "730"     # ~2 years
+          NEWS_CHUNK_DAYS: "30"      # window size
+          NEWS_PAGE_LIMIT: "50"
+          NEWS_PAUSE_SEC: "0.2"
+        run: python news_backfill.py
