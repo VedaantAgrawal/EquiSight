@@ -1,0 +1,36 @@
+name: update-news-15m
+
+on:
+  workflow_dispatch:   # allows manual runs
+  schedule:
+    - cron: "*/15 13-19 * * 1-5"  # every 15 min, 13:00–19:59 UTC, Mon–Fri
+    - cron: "30 20 * * 1-5"       # one extra run at 20:30 UTC
+
+concurrency:
+  group: news-15m
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+
+      # This script: fetches today's news from Alpaca -> upserts to Neon -> writes to Google Sheet (Sheet_ID_NEWS)
+      - name: Update Neon DB + Google Sheet with today's news
+        env:
+          DB_URL: ${{ secrets.DB_URL }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          SYMBOLS: ${{ secrets.SYMBOLS }}
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}  # same service account as stocks
+          SHEET_ID_NEWS: ${{ secrets.SHEET_ID_NEWS }}              # the new news sheet's ID
+          NEWS_SHEET_TAB: "Sheet1"                                 # or rename if your first tab is different
+          NEWS_OVERLAP_HOURS: "2"                                  # optional overlap
+          NEWS_PAGE_LIMIT: "50"
+          NEWS_PAUSE_SEC: "0.15"
+        run: python sheet_update_news.py
