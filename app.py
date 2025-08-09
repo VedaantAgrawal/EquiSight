@@ -3,29 +3,29 @@ import json
 import datetime as dt
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, dcc, html, Input, Output, dash_table, State
+from dash import Dash, dcc, html, Input, Output, State, dash_table
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import psycopg
 
 # =================== CONFIG / ENV ===================
-# Sheets (for the candlestick tab)
-SA_JSON = os.environ.get("GCP_SERVICE_ACCOUNT")  # full JSON string
-SHEET_ID = os.environ.get("SHEET_ID")            # your sheet id
+SA_JSON = os.environ.get("GCP_SERVICE_ACCOUNT")   # full JSON string
+SHEET_ID = os.environ.get("SHEET_ID")             # your sheet id
 
-# Neon DSN
 RAW_DB_URL = (os.environ.get("DB_URL") or "").strip()
 DB_DSN = RAW_DB_URL.replace("postgresql+psycopg://", "postgresql://") if RAW_DB_URL else ""
 if DB_DSN and "sslmode=" not in DB_DSN:
     DB_DSN += ("&" if "?" in DB_DSN else "?") + "sslmode=require"
 
-# Tracked symbols from env (always included in dropdown)
 TRACKED_SYMBOLS = sorted([
     s.strip().upper()
     for s in (os.environ.get("SYMBOLS", "")).split(",")
     if s.strip()
 ])
+
 print("[boot] TRACKED_SYMBOLS:", TRACKED_SYMBOLS)
+print("[boot] SHEET_ID set:", bool(SHEET_ID), "DB_DSN set:", bool(DB_DSN))
 
 REFRESH_MS = 15 * 60 * 1000  # 15 minutes
 # ====================================================
@@ -52,18 +52,40 @@ def load_today_sheet_df():
 
     if not values:
         return pd.DataFrame(columns=["symbol","timestamp_utc","open","high","low","close","volume"])
+
     df = pd.DataFrame(values[1:], columns=values[0])
     if df.empty:
         return df
+
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
     for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
     today = pd.Timestamp.now(tz="UTC").date()
     df = df[df["timestamp_utc"].dt.date == today]
     df = df.dropna(subset=["symbol","timestamp_utc"]).sort_values(["symbol","timestamp_utc"])
     return df.reset_index(drop=True)
 
+def load_sheet_symbols():
+    """All distinct symbols from the sheet (no date filter)."""
+    gc = gs_client()
+    if not gc:
+        return []
+    try:
+        ws = gc.open_by_key(SHEET_ID).sheet1
+        values = ws.get_all_values()
+        if not values or len(values) < 2:
+            return []
+        df_all = pd.DataFrame(values[1:], columns=values[0])
+        if "symbol" not in df_all.columns:
+            return []
+        return sorted(df_all["symbol"].dropna().str.upper().unique().tolist())
+    except Exception as e:
+        print(f"[warn] load_sheet_symbols failed: {e}")
+        return []
+
 def make_candle(fig_df: pd.DataFrame, symbol: str) -> go.Figure:
+    # Fixed UTC RTH window 13:30 → 19:45
     today = pd.Timestamp.now(tz="UTC").date()
     start = pd.Timestamp.combine(today, dt.time(13, 30, tzinfo=dt.timezone.utc))
     end   = pd.Timestamp.combine(today, dt.time(19, 45, tzinfo=dt.timezone.utc))
@@ -126,19 +148,22 @@ def news_distinct_symbols():
         return []
 
 def dropdown_options():
-    # Always include env
+    # start with env-tracked symbols
     syms = set(TRACKED_SYMBOLS)
-    # Add any symbols found in the backfill table
+    # add all symbols present anywhere in the sheet
+    syms.update(load_sheet_symbols())
+    # add any symbols seen in the backfill news table
     syms.update(news_distinct_symbols())
     if not syms:
         syms = {"AAPL"}
-    return [{"label": s, "value": s} for s in sorted(syms)]
+    opts = [{"label": s, "value": s} for s in sorted(syms)]
+    print(f"[dropdown] options: {', '.join([o['value'] for o in opts])}")
+    return opts
 
 # ---------------- Dash app ----------------
 app = Dash(__name__)
 app.title = "OHLC + News (Live)"
 
-# Defaults for news date range = today UTC
 _today = pd.Timestamp.now(tz="UTC").date()
 initial_options = dropdown_options()
 initial_symbol = (TRACKED_SYMBOLS[0] if TRACKED_SYMBOLS else (initial_options[0]["value"] if initial_options else "AAPL"))
@@ -191,13 +216,21 @@ def show_date_controls(tab):
         )
     ])
 
-# Keep dropdown options fresh in case new symbols show up in `news`
+# Keep dropdown options fresh and ensure value is valid
 @app.callback(
     Output("symbol", "options"),
+    Output("symbol", "value"),
+    Input("tabs", "value"),        # fire once at startup too
     Input("tick", "n_intervals"),
+    State("symbol", "value"),
 )
-def refresh_dropdown(_n):
-    return dropdown_options()
+def refresh_dropdown(_tab, _n, current_value):
+    opts = dropdown_options()
+    values = [o["value"] for o in opts]
+    if current_value in values:
+        return opts, current_value
+    new_value = values[0] if values else "AAPL"
+    return opts, new_value
 
 # Content switcher
 @app.callback(
@@ -213,14 +246,13 @@ def render_content(tab, symbol, _n, start_date, end_date):
     if tab == "chart":
         df = load_today_sheet_df()
         if df.empty:
-            fig = make_candle(pd.DataFrame(columns=df.columns), symbol if symbol else "AAPL")
+            fig = make_candle(pd.DataFrame(columns=["symbol","timestamp_utc","open","high","low","close","volume"]), symbol or "AAPL")
             return dcc.Graph(figure=fig, config={"displaylogo": False}), "No rows for today yet."
         last_ts = df["timestamp_utc"].max()
         fig = make_candle(df, symbol)
         return dcc.Graph(figure=fig, config={"displaylogo": False}), f"Rows: {len(df)} — Last: {last_ts.strftime('%H:%M UTC')}"
 
     # News tab
-    # Defaults if date picker is empty
     try:
         s_date = pd.to_datetime(start_date).date() if start_date else _today
         e_date = pd.to_datetime(end_date).date() if end_date else _today
@@ -228,14 +260,10 @@ def render_content(tab, symbol, _n, start_date, end_date):
         s_date, e_date = _today, _today
 
     ndf = load_news_df(s_date, e_date)
-    if ndf.empty:
-        return html.Div(f"No news rows between {s_date} and {e_date}."), ""
-
-    # Filter by symbol
     if symbol:
         ndf = ndf[ndf["symbol"] == symbol].copy()
     if ndf.empty:
-        return html.Div(f"No news rows for {symbol} between {s_date} and {e_date}."), ""
+        return html.Div(f"No news rows for {symbol or 'selected symbols'} between {s_date} and {e_date}."), ""
 
     ndf["published_at"] = pd.to_datetime(ndf["published_at"], utc=True, errors="coerce")
     ndf["time_utc"] = ndf["published_at"].dt.strftime("%Y-%m-%d %H:%M")
@@ -253,7 +281,7 @@ def render_content(tab, symbol, _n, start_date, end_date):
         {"name":"ID",         "id":"id"},
     ]
     table = dash_table.DataTable(
-        data=ndf[ [c["id"] for c in cols] ].to_dict("records"),
+        data=ndf[[c["id"] for c in cols]].to_dict("records"),
         columns=cols,
         page_size=20,
         sort_action="native",
