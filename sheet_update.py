@@ -1,85 +1,63 @@
 import os
 import json
-import datetime as dt
-
+from datetime import timezone
 import psycopg
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from gspread import WorksheetNotFound
 
+# ========= ENV / CONNECTIONS =========
+# Neon
+raw_url = os.environ["DB_URL"].strip()  # may be postgresql+psycopg:// or postgresql://
+DB_URL = raw_url.replace("postgresql+psycopg://", "postgresql://")
+if "sslmode=" not in DB_URL:
+    DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
 
-# -------- Google auth (service account JSON comes from GitHub secret) --------
-service_account_info = json.loads(os.environ["GCP_SERVICE_ACCOUNT"])
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-creds = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, SCOPES)
-gc = gspread.authorize(creds)
-
+# Google Sheets
 SHEET_ID = os.environ["SHEET_ID"]
-ws = gc.open_by_key(SHEET_ID).sheet1  # use the first worksheet
+SA_JSON  = os.environ["GCP_SERVICE_ACCOUNT"]   # full JSON string for service account
 
+# Sheet tab names (you said: Sheet1 for OHLCV, "Sheet 2" for news)
+OHLCV_TAB = os.getenv("OHLCV_SHEET_TAB", "Sheet1")
+NEWS_TAB  = os.getenv("NEWS_SHEET_TAB",  "Sheet 2")
 
-# ----------------------- Build a psycopg-friendly DSN ------------------------
-raw_db_url = os.environ["DB_URL"].strip()  # e.g. postgresql+psycopg://... or postgresql://...
-dsn = raw_db_url.replace("postgresql+psycopg://", "postgresql://")
+# Bars table details (so we don’t need to hardcode your schema)
+BARS_TABLE   = os.getenv("BARS_TABLE", "bars")                 # change if your table is different
+BARS_TS_COL  = os.getenv("BARS_TS_COL", "timestamp_utc")       # change if your ts column is different
 
-# Ensure Neon-required SSL flag is present
-if "sslmode=" not in dsn:
-    dsn = dsn + ("&" if "?" in dsn else "?") + "sslmode=require"
-
-
-# ------------------------- Query today's OHLCV rows --------------------------
-# Uses UTC date. If you prefer US/Eastern “trading day”, we can shift the timezone.
-today_utc = dt.datetime.now(dt.timezone.utc).date()
-
-query = """
-    SELECT symbol, t, open, high, low, close, volume
-    FROM ohlcv_bars
-    WHERE t::date = %s
-    ORDER BY symbol, t;
-"""
-
-with psycopg.connect(dsn) as conn:
-    with conn.cursor() as cur:
-        cur.execute(query, (today_utc,))
-        rows = cur.fetchall()
-
-
-# --------------------------- Write to Google Sheet ---------------------------
-# Build data array (header + all rows) and push in ONE update for speed.
-header = ["symbol", "timestamp_utc", "open", "high", "low", "close", "volume"]
-data = [header]
-for symbol, ts, o, h, l, c, v in rows:
-    # standardize timestamp for Sheets
-    data.append([symbol, ts.isoformat(), o, h, l, c, v])
-
-# Clear entire sheet, then write starting at A1
-ws.clear()
-ws.update("A1", data, value_input_option="RAW")
-
-print(f"[sheet_update] Wrote {len(rows)} rows to Google Sheet for {today_utc}")
-
-# =========================
-# NEWS → Google Sheets ("Sheet 2")
-# =========================
-
-NEWS_TAB_NAME = os.getenv("NEWS_SHEET_TAB", "Sheet 2")  # you said you created "Sheet 2" manually
-
-def _gs_client():
-    """Reuse your service account JSON in env GCP_SERVICE_ACCOUNT to auth gspread."""
-    sa_json = os.environ.get("GCP_SERVICE_ACCOUNT")
-    if not sa_json:
-        raise RuntimeError("GCP_SERVICE_ACCOUNT env var is missing")
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(sa_json), scopes)
+def gs_client():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets",
+              "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(SA_JSON), scopes)
     return gspread.authorize(creds)
 
-def fetch_todays_news_rows():
-    """Fetch today's (UTC) news rows from the persistent `news` table."""
+# ========= FETCH FROM NEON =========
+def fetch_todays_ohlcv():
+    """
+    Reads today's rows from your bars table.
+    Expected columns: symbol, <ts>, open, high, low, close, volume
+    """
+    sql = f"""
+        SELECT
+          symbol,
+          {BARS_TS_COL} AS timestamp_utc,
+          open, high, low, close, volume
+        FROM {BARS_TABLE}
+        WHERE {BARS_TS_COL}::date = CURRENT_DATE
+        ORDER BY symbol, {BARS_TS_COL};
+    """
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            cols = [d.name for d in cur.description]
+    return cols, rows
+
+def fetch_todays_news():
+    """
+    Reads today's rows from persistent `news` table.
+    Columns: symbol, published_at, source, headline, summary, author, url, id
+    """
     sql = """
         SELECT symbol, published_at, source, headline, summary, author, url, id
         FROM news
@@ -93,44 +71,57 @@ def fetch_todays_news_rows():
             cols = [d.name for d in cur.description]
     return cols, rows
 
-def write_news_to_sheet2():
-    sheet_id = os.environ.get("SHEET_ID")
-    if not sheet_id:
-        raise RuntimeError("SHEET_ID env var is missing")
-
-    cols, rows = fetch_todays_news_rows()
-
-    gc = _gs_client()
-    sh = gc.open_by_key(sheet_id)
-
+# ========= WRITE TO SHEETS =========
+def ensure_ws(sh, title: str):
     try:
-        ws = sh.worksheet(NEWS_TAB_NAME)
+        return sh.worksheet(title)
     except WorksheetNotFound:
-        # You said you created "Sheet 2" manually; if not found, create it.
-        ws = sh.add_worksheet(title=NEWS_TAB_NAME, rows=1000, cols=12)
+        # Make a new tab if missing
+        return sh.add_worksheet(title=title, rows=2000, cols=20)
+
+def write_sheet(tab_name: str, cols, rows, ts_index: int | None):
+    """
+    Clears tab and writes header+rows. If ts_index is provided, convert it to ISO UTC.
+    """
+    gc = gs_client()
+    sh = gc.open_by_key(SHEET_ID)
+    ws = ensure_ws(sh, tab_name)
 
     # Clear existing content
     ws.clear()
 
-    # Prepare header + data
     values = [cols]
     for r in rows:
         r = list(r)
-        # Ensure published_at is ISO in UTC (index 1 given the SELECT)
-        if r[1] is not None and hasattr(r[1], "astimezone"):
-            r[1] = r[1].astimezone(timezone.utc).isoformat()
+        if ts_index is not None and 0 <= ts_index < len(r):
+            ts = r[ts_index]
+            if ts is not None and hasattr(ts, "astimezone"):
+                r[ts_index] = ts.astimezone(timezone.utc).isoformat()
         values.append(r)
 
-    # Write starting at A1 (note: values first, then range_name to avoid deprecation warning)
+    # Use new signature to avoid DeprecationWarning: values first, then range_name
     ws.update(values=values, range_name="A1", value_input_option="RAW")
-    print(f"[sheet_update_news] Wrote {len(rows)} rows to '{NEWS_TAB_NAME}'")
 
-# ---- Call the news writer at the very end of your script's main flow ----
-if __name__ == "__main__":
-    # your existing stock/ohlcv writing code runs first...
-    # then append:
+def main():
+    # ---- OHLCV → Sheet1 ----
+    o_cols, o_rows = fetch_todays_ohlcv()
+    # Find the timestamp column index in returned columns
     try:
-        write_news_to_sheet2()
-    except Exception as e:
-        print(f"[sheet_update_news] Failed to write news: {e}")
+        o_ts_idx = o_cols.index("timestamp_utc")
+    except ValueError:
+        o_ts_idx = None
+    write_sheet(OHLCV_TAB, o_cols, o_rows, ts_index=o_ts_idx)
+    print(f"[sheet_update] OHLCV: wrote {len(o_rows)} rows to '{OHLCV_TAB}'")
 
+    # ---- NEWS → "Sheet 2" ----
+    n_cols, n_rows = fetch_todays_news()
+    # published_at is the second column per SELECT (index 1)
+    try:
+        n_ts_idx = n_cols.index("published_at")
+    except ValueError:
+        n_ts_idx = None
+    write_sheet(NEWS_TAB, n_cols, n_rows, ts_index=n_ts_idx)
+    print(f"[sheet_update] NEWS: wrote {len(n_rows)} rows to '{NEWS_TAB}'")
+
+if __name__ == "__main__":
+    main()
