@@ -25,6 +25,8 @@ TRACKED_SYMBOLS = sorted([
     for s in (os.environ.get("SYMBOLS", "")).split(",")
     if s.strip()
 ])
+print("[boot] TRACKED_SYMBOLS:", TRACKED_SYMBOLS)
+
 
 REFRESH_MS = 15 * 60 * 1000  # 15 minutes
 # ====================================================
@@ -115,11 +117,36 @@ def symbols_from_sources(sheet_df, news_df):
     return sorted(s) or ["AAPL"]
 
 def dropdown_options():
-    # Recompute options on every refresh so new symbols appear
-    _sdf = load_today_sheet_df()
-    _ndf = load_today_news_df()
-    syms = symbols_from_sources(_sdf, _ndf)
-    return [{"label": s, "value": s} for s in syms]
+    # Always start with env symbols
+    symbols = set(TRACKED_SYMBOLS)
+
+    # Try to read sheet and add all distinct symbols (ignoring date filter)
+    try:
+        gc = gs_client()
+        if gc:
+            ws = gc.open_by_key(SHEET_ID).sheet1
+            values = ws.get_all_values()
+            if values and len(values) > 1:
+                df_all = pd.DataFrame(values[1:], columns=values[0])
+                if "symbol" in df_all.columns:
+                    symbols.update(df_all["symbol"].dropna().str.upper().unique().tolist())
+    except Exception as e:
+        print(f"[warn] dropdown sheet probe failed: {e}")
+
+    # Add any symbols present in today's news table (if available)
+    try:
+        ndf = load_today_news_df()
+        if not ndf.empty and "symbol" in ndf.columns:
+            symbols.update(ndf["symbol"].dropna().str.upper().unique().tolist())
+    except Exception as e:
+        print(f"[warn] dropdown news probe failed: {e}")
+
+    # Final fallback
+    if not symbols:
+        symbols = {"AAPL"}
+
+    return [{"label": s, "value": s} for s in sorted(symbols)]
+
 
 # ---------------- Dash app ----------------
 app = Dash(__name__)
