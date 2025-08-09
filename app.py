@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import datetime as dt
 import pandas as pd
@@ -9,7 +10,9 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # ======== ENV VARS ========
 SA_JSON = os.environ["GCP_SERVICE_ACCOUNT"]
-SHEET_ID = os.environ["SHEET_ID"]
+SHEET_ID = os.environ["SHEET_ID"]                  # OHLCV sheet (Sheet1)
+SHEET_ID_NEWS = os.environ.get("SHEET_ID_NEWS")    # News sheet (separate file)
+NEWS_SHEET_TAB = os.environ.get("NEWS_SHEET_TAB", "Sheet1")
 REFRESH_MS = 15 * 60 * 1000  # 15 minutes
 
 TRACKED_SYMBOLS = sorted([
@@ -17,6 +20,13 @@ TRACKED_SYMBOLS = sorted([
     for s in os.environ.get("SYMBOLS","").split(",")
     if s.strip()
 ])
+
+# -------- gspread helpers --------
+def _normalize_sheet_id(raw: str) -> str:
+    if not raw:
+        return ""
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", raw)
+    return m.group(1) if m else raw.strip()
 
 def gs_client():
     scopes = [
@@ -26,6 +36,7 @@ def gs_client():
     creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(SA_JSON), scopes)
     return gspread.authorize(creds)
 
+# -------- OHLCV (Sheet_ID) --------
 def load_today_df():
     gc = gs_client()
     ws = gc.open_by_key(SHEET_ID).sheet1
@@ -44,7 +55,6 @@ def load_today_df():
     return df
 
 def load_sheet_symbols():
-    """All distinct symbols from the sheet (no date filter)."""
     try:
         gc = gs_client()
         ws = gc.open_by_key(SHEET_ID).sheet1
@@ -65,7 +75,6 @@ def dropdown_options():
     if not syms:
         syms = {"AAPL"}
     opts = [{"label": s, "value": s} for s in sorted(syms)]
-    print(f"[dropdown] {', '.join([o['value'] for o in opts])}")
     return opts
 
 def make_candle(fig_df: pd.DataFrame, symbol: str) -> go.Figure:
@@ -97,9 +106,63 @@ def make_candle(fig_df: pd.DataFrame, symbol: str) -> go.Figure:
     )
     return f
 
+# -------- News (SHEET_ID_NEWS) --------
+def load_today_news_df():
+    if not SHEET_ID_NEWS:
+        return pd.DataFrame(columns=["symbol","published_at","source","headline","summary","author","url","id"])
+    gc = gs_client()
+    sid = _normalize_sheet_id(SHEET_ID_NEWS)
+    sh = gc.open_by_key(sid)
+    try:
+        ws = sh.worksheet(NEWS_SHEET_TAB)
+    except gspread.WorksheetNotFound:
+        # try first sheet as fallback
+        ws = sh.sheet1
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return pd.DataFrame(columns=["symbol","published_at","source","headline","summary","author","url","id"])
+    df = pd.DataFrame(values[1:], columns=values[0])
+
+    # coerce types
+    if "published_at" in df.columns:
+        df["published_at"] = pd.to_datetime(df["published_at"], utc=True, errors="coerce")
+    for col in ["symbol","source","headline","summary","author","url","id"]:
+        if col not in df.columns:
+            df[col] = None
+
+    today = pd.Timestamp.now(tz="UTC").date()
+    if "published_at" in df.columns:
+        df = df[df["published_at"].dt.date == today]
+
+    df["symbol"] = df["symbol"].str.upper()
+    df = df.dropna(subset=["symbol","published_at"]).sort_values(["symbol","published_at"], ascending=[True, False]).reset_index(drop=True)
+    return df
+
+def news_cards(df: pd.DataFrame, symbol: str):
+    sdf = df[df["symbol"] == symbol] if not df.empty else pd.DataFrame()
+    if sdf.empty:
+        return html.Div("No news for today yet.", style={"color":"#666","marginTop":"8px"})
+
+    items = []
+    for _, r in sdf.iterrows():
+        ts = r["published_at"]
+        time_str = ts.strftime("%H:%M UTC") if pd.notna(ts) else ""
+        meta_bits = [b for b in [r.get("author"), time_str, r.get("source")] if b]
+        meta = " · ".join(meta_bits)
+        url = r.get("url")
+        headline_el = html.A(r.get("headline",""), href=url, target="_blank", style={"fontWeight":"600","textDecoration":"none","color":"#1a73e8"}) if url else html.Div(r.get("headline",""), style={"fontWeight":"600"})
+        items.append(
+            html.Div([
+                headline_el,
+                html.Div(r.get("summary",""), style={"fontSize":"13px","color":"#333","marginTop":"4px"}),
+                html.Div(meta, style={"fontSize":"11px","color":"#777","marginTop":"4px","wordWrap":"break-word"}),
+            ], style={"padding":"10px 0","borderBottom":"1px solid #eee"})
+        )
+    return html.Div(items)
+
 # ---- Dash app ----
 app = Dash(__name__)
-app.title = "OHLC Live (Google Sheet)"
+app.title = "OHLC + News (Google Sheets)"
 
 initial_opts = dropdown_options()
 initial_val = initial_opts[0]["value"] if initial_opts else "AAPL"
@@ -119,7 +182,12 @@ app.layout = html.Div(
             ),
             html.Span(id="status", style={"marginLeft":"12px", "color":"#666"})
         ], style={"display":"flex","alignItems":"center","gap":"12px","marginBottom":"12px"}),
+
         dcc.Graph(id="chart", config={"displaylogo": False}),
+        html.Hr(),
+        html.H3("News (today)"),
+        html.Div(id="news-list"),
+
         dcc.Interval(id="tick", interval=REFRESH_MS, n_intervals=0)
     ]
 )
@@ -138,13 +206,14 @@ def refresh_dropdown(_n, current_value):
         return opts, current_value
     return opts, (values[0] if values else "AAPL")
 
+# Update chart + status
 @app.callback(
     Output("chart","figure"),
     Output("status","children"),
     Input("symbol","value"),
     Input("tick","n_intervals"),
 )
-def refresh(symbol, _n):
+def refresh_chart(symbol, _n):
     df = load_today_df()
     if df.empty:
         fig = make_candle(pd.DataFrame(columns=["symbol","timestamp_utc","open","high","low","close","volume"]), symbol or "AAPL")
@@ -152,6 +221,16 @@ def refresh(symbol, _n):
     last_ts = df["timestamp_utc"].max()
     fig = make_candle(df, symbol or "AAPL")
     return fig, f"Rows: {len(df)} — Last: {last_ts.strftime('%H:%M UTC')}"
+
+# Update news
+@app.callback(
+    Output("news-list","children"),
+    Input("symbol","value"),
+    Input("tick","n_intervals"),
+)
+def refresh_news(symbol, _n):
+    ndf = load_today_news_df()
+    return news_cards(ndf, symbol or "AAPL")
 
 server = app.server
 if __name__ == "__main__":
