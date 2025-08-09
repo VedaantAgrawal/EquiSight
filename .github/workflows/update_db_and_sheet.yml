@@ -1,10 +1,10 @@
 name: update-db-and-sheet-15m
 
 on:
-  workflow_dispatch: {}         # manual runs
+  workflow_dispatch: {}          # allow manual runs
   schedule:
     - cron: "*/15 13-19 * * 1-5"  # every 15 min, 13:00–19:59 UTC, Mon–Fri
-    - cron: "30 20 * * 1-5"       # extra run at 20:30 UTC
+    - cron: "30 20 * * 1-5"       # one extra run at 20:30 UTC
 
 concurrency:
   group: db-and-sheet
@@ -38,15 +38,18 @@ jobs:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
           SYMBOLS: ${{ secrets.SYMBOLS }}
-          NEWS_WINDOW_HOURS: "48"     # overlap, adjust if you want
+          NEWS_WINDOW_HOURS: "48"     # overlap
           NEWS_PAGE_LIMIT: "50"
           NEWS_PAUSE_SEC: "0.2"
         run: python news_update.py
 
-      - name: Update Google Sheet with today's data (OHLCV + News->Sheet 2)
+      - name: Update Google Sheet (Sheet1=OHLCV, 'Sheet 2'=News)
         env:
-          DB_URL: ${{ secrets.DB_URL }}                 # needed for the news copy
+          DB_URL: ${{ secrets.DB_URL }}
           GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          NEWS_SHEET_TAB: "Sheet 2"                     # you created this tab
+          OHLCV_SHEET_TAB: "Sheet1"     # optional; defaults shown here
+          NEWS_SHEET_TAB: "Sheet 2"
+          BARS_TABLE: ${{ secrets.BARS_TABLE }}   # optional; if unset defaults to "bars"
+          BARS_TS_COL: ${{ secrets.BARS_TS_COL }} # optional; if unset defaults to "timestamp_utc"
         run: python sheet_update.py
