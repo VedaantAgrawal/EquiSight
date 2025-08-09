@@ -3,7 +3,7 @@ import json
 import datetime as dt
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, dcc, html, Input, Output, dash_table
+from dash import Dash, dcc, html, Input, Output, dash_table, State
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import psycopg
@@ -13,8 +13,8 @@ import psycopg
 SA_JSON = os.environ.get("GCP_SERVICE_ACCOUNT")  # full JSON string
 SHEET_ID = os.environ.get("SHEET_ID")            # your sheet id
 
-# Neon (for the news tab)
-RAW_DB_URL = (os.environ.get("DB_URL") or "").strip()     # may be postgresql+psycopg://...
+# Neon DSN
+RAW_DB_URL = (os.environ.get("DB_URL") or "").strip()
 DB_DSN = RAW_DB_URL.replace("postgresql+psycopg://", "postgresql://") if RAW_DB_URL else ""
 if DB_DSN and "sslmode=" not in DB_DSN:
     DB_DSN += ("&" if "?" in DB_DSN else "?") + "sslmode=require"
@@ -26,7 +26,6 @@ TRACKED_SYMBOLS = sorted([
     if s.strip()
 ])
 print("[boot] TRACKED_SYMBOLS:", TRACKED_SYMBOLS)
-
 
 REFRESH_MS = 15 * 60 * 1000  # 15 minutes
 # ====================================================
@@ -44,8 +43,13 @@ def load_today_sheet_df():
     gc = gs_client()
     if not gc:
         return pd.DataFrame(columns=["symbol","timestamp_utc","open","high","low","close","volume"])
-    ws = gc.open_by_key(SHEET_ID).sheet1
-    values = ws.get_all_values()
+    try:
+        ws = gc.open_by_key(SHEET_ID).sheet1
+        values = ws.get_all_values()
+    except Exception as e:
+        print(f"[warn] Sheets access failed: {e}")
+        return pd.DataFrame(columns=["symbol","timestamp_utc","open","high","low","close","volume"])
+
     if not values:
         return pd.DataFrame(columns=["symbol","timestamp_utc","open","high","low","close","volume"])
     df = pd.DataFrame(values[1:], columns=values[0])
@@ -89,72 +93,56 @@ def make_candle(fig_df: pd.DataFrame, symbol: str) -> go.Figure:
     )
     return f
 
-# ---------------- Neon helpers (News tab) ----------------
-def load_today_news_df():
-    """Pull all today_news rows (UTC day) from Neon."""
+# ---------------- Neon helpers (NEWS from backfill table) ----------------
+def load_news_df(start_date, end_date):
+    """
+    Pull rows from persistent `news` table between start_date and end_date (inclusive).
+    Dates must be datetime.date objects in UTC context.
+    """
     if not DB_DSN:
         return pd.DataFrame(columns=["symbol","published_at","source","headline","summary","author","url","id"])
     with psycopg.connect(DB_DSN) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT symbol, published_at, source, headline, summary, author, url, id
-                FROM today_news
-                WHERE published_at::date = CURRENT_DATE
+                FROM news
+                WHERE published_at::date BETWEEN %s AND %s
                 ORDER BY symbol, published_at DESC;
-            """)
+            """, (start_date, end_date))
             rows = cur.fetchall()
             cols = [desc.name for desc in cur.description]
-    df = pd.DataFrame(rows, columns=cols)
-    return df
+    return pd.DataFrame(rows, columns=cols)
 
-def symbols_from_sources(sheet_df, news_df):
-    """Union of env-tracked symbols and any symbols found in today's data."""
-    s = set(TRACKED_SYMBOLS)
-    if not sheet_df.empty and "symbol" in sheet_df:
-        s.update(sheet_df["symbol"].dropna().str.upper().unique().tolist())
-    if not news_df.empty and "symbol" in news_df:
-        s.update(news_df["symbol"].dropna().str.upper().unique().tolist())
-    return sorted(s) or ["AAPL"]
+def news_distinct_symbols():
+    """Distinct symbols present in `news` (no date filter)."""
+    if not DB_DSN:
+        return []
+    try:
+        with psycopg.connect(DB_DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT symbol FROM news;")
+                return sorted([r[0] for r in cur.fetchall() if r and r[0]])
+    except Exception as e:
+        print(f"[warn] news_distinct_symbols failed: {e}")
+        return []
 
 def dropdown_options():
-    # Always start with env symbols
-    symbols = set(TRACKED_SYMBOLS)
-
-    # Try to read sheet and add all distinct symbols (ignoring date filter)
-    try:
-        gc = gs_client()
-        if gc:
-            ws = gc.open_by_key(SHEET_ID).sheet1
-            values = ws.get_all_values()
-            if values and len(values) > 1:
-                df_all = pd.DataFrame(values[1:], columns=values[0])
-                if "symbol" in df_all.columns:
-                    symbols.update(df_all["symbol"].dropna().str.upper().unique().tolist())
-    except Exception as e:
-        print(f"[warn] dropdown sheet probe failed: {e}")
-
-    # Add any symbols present in today's news table (if available)
-    try:
-        ndf = load_today_news_df()
-        if not ndf.empty and "symbol" in ndf.columns:
-            symbols.update(ndf["symbol"].dropna().str.upper().unique().tolist())
-    except Exception as e:
-        print(f"[warn] dropdown news probe failed: {e}")
-
-    # Final fallback
-    if not symbols:
-        symbols = {"AAPL"}
-
-    return [{"label": s, "value": s} for s in sorted(symbols)]
-
+    # Always include env
+    syms = set(TRACKED_SYMBOLS)
+    # Add any symbols found in the backfill table
+    syms.update(news_distinct_symbols())
+    if not syms:
+        syms = {"AAPL"}
+    return [{"label": s, "value": s} for s in sorted(syms)]
 
 # ---------------- Dash app ----------------
 app = Dash(__name__)
 app.title = "OHLC + News (Live)"
 
-# initial options/values
+# Defaults for news date range = today UTC
+_today = pd.Timestamp.now(tz="UTC").date()
 initial_options = dropdown_options()
-initial_value = (TRACKED_SYMBOLS[0] if TRACKED_SYMBOLS else (initial_options[0]["value"] if initial_options else "AAPL"))
+initial_symbol = (TRACKED_SYMBOLS[0] if TRACKED_SYMBOLS else (initial_options[0]["value"] if initial_options else "AAPL"))
 
 app.layout = html.Div(
     style={"maxWidth":"1200px","margin":"20px auto","fontFamily":"Inter,system-ui,Arial"},
@@ -162,25 +150,49 @@ app.layout = html.Div(
         html.H2("Intraday Dashboard"),
         dcc.Tabs(id="tabs", value="chart", children=[
             dcc.Tab(label="Candles", value="chart"),
-            dcc.Tab(label="News (today)", value="news"),
+            dcc.Tab(label="News (from backfill)", value="news"),
         ]),
-        html.Div([
-            html.Label("Symbol", style={"marginRight":"8px"}),
+
+        # Controls (symbol + date range for news)
+        html.Div(id="controls", style={"display":"flex","alignItems":"center","gap":"12px","margin":"12px 0"}, children=[
+            html.Label("Symbol"),
             dcc.Dropdown(
                 id="symbol",
                 options=initial_options,
-                value=initial_value,
+                value=initial_symbol,
                 clearable=False,
                 style={"width":"260px"}
             ),
-            html.Span(id="status", style={"marginLeft":"12px","color":"#666"})
-        ], id="controls", style={"display":"flex","alignItems":"center","gap":"12px","margin":"12px 0"}),
+            html.Div(id="news-date-controls"),  # date picker appears only on News tab
+            html.Span(id="status", style={"marginLeft":"8px","color":"#666"})
+        ]),
+
         html.Div(id="content"),
         dcc.Interval(id="tick", interval=REFRESH_MS, n_intervals=0)  # global refresh
     ]
 )
 
-# Keep dropdown options fresh (includes TRACKED_SYMBOLS + new data symbols)
+# Show date picker only on News tab
+@app.callback(
+    Output("news-date-controls", "children"),
+    Input("tabs", "value"),
+)
+def show_date_controls(tab):
+    if tab != "news":
+        return ""
+    return html.Div(style={"display":"flex","alignItems":"center","gap":"8px"}, children=[
+        html.Label("Date range (UTC)"),
+        dcc.DatePickerRange(
+            id="date_range",
+            start_date=str(_today),
+            end_date=str(_today),
+            display_format="YYYY-MM-DD",
+            minimum_nights=0,
+            clearable=True
+        )
+    ])
+
+# Keep dropdown options fresh in case new symbols show up in `news`
 @app.callback(
     Output("symbol", "options"),
     Input("tick", "n_intervals"),
@@ -188,15 +200,17 @@ app.layout = html.Div(
 def refresh_dropdown(_n):
     return dropdown_options()
 
-# Content area
+# Content switcher
 @app.callback(
     Output("content","children"),
     Output("status","children"),
     Input("tabs","value"),
     Input("symbol","value"),
     Input("tick","n_intervals"),
+    State("date_range", "start_date"),
+    State("date_range", "end_date"),
 )
-def render_content(tab, symbol, _n):
+def render_content(tab, symbol, _n, start_date, end_date):
     if tab == "chart":
         df = load_today_sheet_df()
         if df.empty:
@@ -205,39 +219,52 @@ def render_content(tab, symbol, _n):
         last_ts = df["timestamp_utc"].max()
         fig = make_candle(df, symbol)
         return dcc.Graph(figure=fig, config={"displaylogo": False}), f"Rows: {len(df)} — Last: {last_ts.strftime('%H:%M UTC')}"
-    else:
-        # News tab
-        ndf = load_today_news_df()
-        if ndf.empty:
-            return html.Div("No news rows for today yet."), ""
-        sdf = ndf[ndf["symbol"] == symbol].copy() if symbol else ndf.copy()
-        sdf["published_at"] = pd.to_datetime(sdf["published_at"], utc=True, errors="coerce")
-        sdf["time_utc"] = sdf["published_at"].dt.strftime("%H:%M")
-        sdf["headline_link"] = sdf.apply(
-            lambda r: f"[{r['headline']}]({r['url']})" if pd.notna(r.get("url")) and pd.notna(r.get("headline")) else (r.get("headline") or ""),
-            axis=1
-        )
-        cols = [
-            {"name":"Time (UTC)", "id":"time_utc"},
-            {"name":"Source",     "id":"source"},
-            {"name":"Headline",   "id":"headline_link", "presentation":"markdown"},
-            {"name":"Summary",    "id":"summary"},
-            {"name":"Author",     "id":"author"},
-            {"name":"URL",        "id":"url"},
-            {"name":"ID",         "id":"id"},
-        ]
-        table = dash_table.DataTable(
-            data=sdf[ [c["id"] for c in cols] ].to_dict("records"),
-            columns=cols,
-            page_size=20,
-            sort_action="native",
-            filter_action="native",
-            style_table={"overflowX":"auto"},
-            style_cell={"whiteSpace":"normal","height":"auto","padding":"6px"},
-            style_header={"fontWeight":"600"},
-        )
-        status = f"Rows: {len(sdf)} — Latest: {sdf['published_at'].max().strftime('%H:%M UTC')}" if not sdf.empty else ""
-        return table, status
+
+    # News tab
+    # Defaults if date picker is empty
+    try:
+        s_date = pd.to_datetime(start_date).date() if start_date else _today
+        e_date = pd.to_datetime(end_date).date() if end_date else _today
+    except Exception:
+        s_date, e_date = _today, _today
+
+    ndf = load_news_df(s_date, e_date)
+    if ndf.empty:
+        return html.Div(f"No news rows between {s_date} and {e_date}."), ""
+
+    # Filter by symbol
+    if symbol:
+        ndf = ndf[ndf["symbol"] == symbol].copy()
+    if ndf.empty:
+        return html.Div(f"No news rows for {symbol} between {s_date} and {e_date}."), ""
+
+    ndf["published_at"] = pd.to_datetime(ndf["published_at"], utc=True, errors="coerce")
+    ndf["time_utc"] = ndf["published_at"].dt.strftime("%Y-%m-%d %H:%M")
+    ndf["headline_link"] = ndf.apply(
+        lambda r: f"[{r['headline']}]({r['url']})" if pd.notna(r.get("url")) and pd.notna(r.get("headline")) else (r.get("headline") or ""),
+        axis=1
+    )
+    cols = [
+        {"name":"Time (UTC)", "id":"time_utc"},
+        {"name":"Source",     "id":"source"},
+        {"name":"Headline",   "id":"headline_link", "presentation":"markdown"},
+        {"name":"Summary",    "id":"summary"},
+        {"name":"Author",     "id":"author"},
+        {"name":"URL",        "id":"url"},
+        {"name":"ID",         "id":"id"},
+    ]
+    table = dash_table.DataTable(
+        data=ndf[ [c["id"] for c in cols] ].to_dict("records"),
+        columns=cols,
+        page_size=20,
+        sort_action="native",
+        filter_action="native",
+        style_table={"overflowX":"auto"},
+        style_cell={"whiteSpace":"normal","height":"auto","padding":"6px"},
+        style_header={"fontWeight":"600"},
+    )
+    status = f"Rows: {len(ndf)} — Latest: {ndf['published_at'].max().strftime('%Y-%m-%d %H:%M UTC')}"
+    return table, status
 
 server = app.server  # for gunicorn/Render
 
