@@ -10,14 +10,21 @@ import psycopg
 
 # =================== CONFIG / ENV ===================
 # Sheets (for the candlestick tab)
-SA_JSON = os.environ.get("GCP_SERVICE_ACCOUNT")
-SHEET_ID = os.environ.get("SHEET_ID")
+SA_JSON = os.environ.get("GCP_SERVICE_ACCOUNT")  # full JSON string
+SHEET_ID = os.environ.get("SHEET_ID")            # your sheet id
 
 # Neon (for the news tab)
-RAW_DB_URL = (os.environ.get("DB_URL") or "").strip()
+RAW_DB_URL = (os.environ.get("DB_URL") or "").strip()     # may be postgresql+psycopg://...
 DB_DSN = RAW_DB_URL.replace("postgresql+psycopg://", "postgresql://") if RAW_DB_URL else ""
 if DB_DSN and "sslmode=" not in DB_DSN:
     DB_DSN += ("&" if "?" in DB_DSN else "?") + "sslmode=require"
+
+# Tracked symbols from env (always included in dropdown)
+TRACKED_SYMBOLS = sorted([
+    s.strip().upper()
+    for s in (os.environ.get("SYMBOLS", "")).split(",")
+    if s.strip()
+])
 
 REFRESH_MS = 15 * 60 * 1000  # 15 minutes
 # ====================================================
@@ -34,7 +41,6 @@ def gs_client():
 def load_today_sheet_df():
     gc = gs_client()
     if not gc:
-        # No sheet config set; return empty frame with expected columns
         return pd.DataFrame(columns=["symbol","timestamp_utc","open","high","low","close","volume"])
     ws = gc.open_by_key(SHEET_ID).sheet1
     values = ws.get_all_values()
@@ -43,11 +49,9 @@ def load_today_sheet_df():
     df = pd.DataFrame(values[1:], columns=values[0])
     if df.empty:
         return df
-    # Types
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
     for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    # Only today's UTC (belt & suspenders)
     today = pd.Timestamp.now(tz="UTC").date()
     df = df[df["timestamp_utc"].dt.date == today]
     df = df.dropna(subset=["symbol","timestamp_utc"]).sort_values(["symbol","timestamp_utc"])
@@ -102,22 +106,28 @@ def load_today_news_df():
     return df
 
 def symbols_from_sources(sheet_df, news_df):
-    """Build symbol list from either source."""
-    s = set()
+    """Union of env-tracked symbols and any symbols found in today's data."""
+    s = set(TRACKED_SYMBOLS)
     if not sheet_df.empty and "symbol" in sheet_df:
-        s.update(sheet_df["symbol"].dropna().unique().tolist())
+        s.update(sheet_df["symbol"].dropna().str.upper().unique().tolist())
     if not news_df.empty and "symbol" in news_df:
-        s.update(news_df["symbol"].dropna().unique().tolist())
+        s.update(news_df["symbol"].dropna().str.upper().unique().tolist())
     return sorted(s) or ["AAPL"]
+
+def dropdown_options():
+    # Recompute options on every refresh so new symbols appear
+    _sdf = load_today_sheet_df()
+    _ndf = load_today_news_df()
+    syms = symbols_from_sources(_sdf, _ndf)
+    return [{"label": s, "value": s} for s in syms]
 
 # ---------------- Dash app ----------------
 app = Dash(__name__)
 app.title = "OHLC + News (Live)"
 
-# initial data & symbol list
-_sheet_df = load_today_sheet_df()
-_news_df  = load_today_news_df()
-symbols = symbols_from_sources(_sheet_df, _news_df)
+# initial options/values
+initial_options = dropdown_options()
+initial_value = (TRACKED_SYMBOLS[0] if TRACKED_SYMBOLS else (initial_options[0]["value"] if initial_options else "AAPL"))
 
 app.layout = html.Div(
     style={"maxWidth":"1200px","margin":"20px auto","fontFamily":"Inter,system-ui,Arial"},
@@ -127,29 +137,29 @@ app.layout = html.Div(
             dcc.Tab(label="Candles", value="chart"),
             dcc.Tab(label="News (today)", value="news"),
         ]),
-        html.Div(id="controls", style={"margin":"12px 0"}),
+        html.Div([
+            html.Label("Symbol", style={"marginRight":"8px"}),
+            dcc.Dropdown(
+                id="symbol",
+                options=initial_options,
+                value=initial_value,
+                clearable=False,
+                style={"width":"260px"}
+            ),
+            html.Span(id="status", style={"marginLeft":"12px","color":"#666"})
+        ], id="controls", style={"display":"flex","alignItems":"center","gap":"12px","margin":"12px 0"}),
         html.Div(id="content"),
         dcc.Interval(id="tick", interval=REFRESH_MS, n_intervals=0)  # global refresh
     ]
 )
 
-# Controls (symbol dropdown) changes per tab
+# Keep dropdown options fresh (includes TRACKED_SYMBOLS + new data symbols)
 @app.callback(
-    Output("controls", "children"),
-    Input("tabs", "value"),
+    Output("symbol", "options"),
+    Input("tick", "n_intervals"),
 )
-def render_controls(tab):
-    return html.Div([
-        html.Label("Symbol", style={"marginRight":"8px"}),
-        dcc.Dropdown(
-            id="symbol",
-            options=[{"label": s, "value": s} for s in symbols],
-            value=symbols[0],
-            clearable=False,
-            style={"width":"260px"}
-        ),
-        html.Span(id="status", style={"marginLeft":"12px","color":"#666"})
-    ], style={"display":"flex","alignItems":"center","gap":"12px"})
+def refresh_dropdown(_n):
+    return dropdown_options()
 
 # Content area
 @app.callback(
@@ -172,11 +182,8 @@ def render_content(tab, symbol, _n):
         # News tab
         ndf = load_today_news_df()
         if ndf.empty:
-            table = html.Div("No news rows for today yet.")
-            return table, ""
-        # Filter by symbol
+            return html.Div("No news rows for today yet."), ""
         sdf = ndf[ndf["symbol"] == symbol].copy() if symbol else ndf.copy()
-        # Pretty columns & link column
         sdf["published_at"] = pd.to_datetime(sdf["published_at"], utc=True, errors="coerce")
         sdf["time_utc"] = sdf["published_at"].dt.strftime("%H:%M")
         sdf["headline_link"] = sdf.apply(
