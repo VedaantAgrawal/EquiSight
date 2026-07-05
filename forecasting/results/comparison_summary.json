@@ -1,0 +1,10 @@
+{
+  "n_symbols": 59,
+  "mean_arima_rmse": 17.03275772487247,
+  "mean_xgb_rmse": 11.314960148674594,
+  "pct_rmse_improvement": 33.56941763956599,
+  "xgb_wins": 52,
+  "wilcoxon_statistic": 98.0,
+  "p_value": 2.845754330488954e-09,
+  "significant_at_0.05": true
+}
