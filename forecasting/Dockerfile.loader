@@ -1,0 +1,6 @@
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir "psycopg[binary]>=3.2"
+COPY forecasting/db_schema.sql forecasting/db_load.py ./
+COPY forecasting/results ./results
+CMD ["python", "db_load.py"]
